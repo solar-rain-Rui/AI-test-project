@@ -179,15 +179,16 @@ REJECT - 评审不通过：[具体问题说明]
         max_turns=2
     )
     
-    full_response = ""
-    review_result = ""
-    async for chunk in team.run_stream(task=task):
+    full_response = "" #用来装AI返回的所有字
+    review_result = "" #用来存“审批结论”(（APPROVE 或 REJECT）)
+    ## 异步流式处理；async for 是“异步迭代器”：因为数据是流式传输的
+    async for chunk in team.run_stream(task=task): ## AI 每蹦出一个词，这个循环就会“苏醒”一次拿到那个 chunk（数据块）
         if hasattr(chunk, 'content') and hasattr(chunk, 'type'):
-            if chunk.type != 'ModelClientStreamingChunkEvent':
+            if chunk.type != 'ModelClientStreamingChunkEvent':#过滤
                 content = chunk.content
-                full_response += content
+                full_response += content#拼接到full_response
                 if "APPROVE" in content or "REJECT" in content:
-                    review_result = content
+                    review_result = content #记录下最后的审核状态
         elif isinstance(chunk, str):
             full_response += chunk
     
@@ -259,6 +260,129 @@ def validate_testcases(testcases):
     return {"valid_testcases": valid_testcases, "stats": stats}
 
 
+def validate_case(testcases):
+    if not testcases or not isinstance(testcases, dict):
+        return {
+            "valid": False,
+            "errors": [{"type": "structure_error", "message": "测试用例为空或格式错误"}]
+        }
+    
+    errors = []
+    
+    required_categories = ["normal", "abnormal", "boundary"]
+    for category in required_categories:
+        if category not in testcases:
+            errors.append({
+                "type": "missing_category",
+                "message": f"缺少测试场景分类: {category}"
+            })
+    
+    for category in required_categories:
+        cases = testcases.get(category, [])
+        if not isinstance(cases, list):
+            errors.append({
+                "type": "type_error",
+                "message": f"{category}场景的用例应该是列表格式"
+            })
+            continue
+        
+        for idx, case in enumerate(cases):
+            if not isinstance(case, dict):
+                errors.append({
+                    "type": "type_error",
+                    "message": f"{category}场景第{idx+1}条用例格式错误"
+                })
+                continue
+            
+            if not all(key in case for key in ["name", "input", "expected"]):
+                missing = [key for key in ["name", "input", "expected"] if key not in case]
+                errors.append({
+                    "type": "missing_field",
+                    "message": f"{category}场景第{idx+1}条用例缺少字段: {', '.join(missing)}"
+                })
+            
+            input_data = case.get("input", {})
+            if not isinstance(input_data, dict):
+                errors.append({
+                    "type": "type_error",
+                    "message": f"{category}场景第{idx+1}条用例的input应该是对象格式"
+                })
+            elif not input_data:
+                errors.append({
+                    "type": "empty_field",
+                    "message": f"{category}场景第{idx+1}条用例的input为空"
+                })
+    
+    return {
+        "valid": len(errors) == 0,
+        "errors": errors
+    }
+
+
+def build_feedback_prompt(task: str, errors: list) -> str:
+    error_messages = []
+    for error in errors:
+        error_messages.append(f"- {error['message']}")
+    
+    feedback = f"""
+以下测试用例存在问题：
+{chr(10).join(error_messages)}
+
+请根据以上问题修正测试用例，并输出符合要求的JSON格式测试用例。
+
+原始需求：
+{task}
+
+要求：
+1. 必须包含 normal、abnormal、boundary 三个分类
+2. 每条用例必须包含 name、input、expected 三个字段
+3. input 必须是对象格式，不能为空
+4. 输出纯JSON，不要包含任何其他内容
+"""
+    return feedback
+
+
+async def generate_with_feedback(task: str, max_retry: int = 2):
+    retry_count = 0
+    last_testcases = None
+    last_errors = []
+    
+    while retry_count <= max_retry:
+        print(f"\n{'='*50}")
+        print(f"[第{retry_count + 1}轮生成] 开始生成测试用例...")
+        print(f"{'='*50}")
+        
+        testcases = await generate_testcases(task)
+        
+        if testcases is None:
+            print(f"[第{retry_count + 1}轮生成] JSON解析失败")
+            retry_count += 1
+            continue
+        
+        validation_result = validate_case(testcases)
+        
+        if validation_result["valid"]:
+            print(f"[第{retry_count + 1}轮生成] ✅ 校验通过！")
+            return testcases
+        else:
+            print(f"[第{retry_count + 1}轮生成] ❌ 校验失败")
+            print(f"[错误详情]:")
+            for error in validation_result["errors"]:
+                print(f"  - {error['message']}")
+            
+            last_testcases = testcases
+            last_errors = validation_result["errors"]
+            
+            if retry_count < max_retry:
+                print(f"\n[准备重试] 构造反馈prompt...")
+                task = build_feedback_prompt(task, validation_result["errors"])
+            
+            retry_count += 1
+    
+    print(f"\n[最终结果] 已达到最大重试次数({max_retry}次)，返回最后一次生成结果")
+    return last_testcases
+
+
 def execute_api_test(test_url, testcases_dict):
     results = []
     for category in ["normal", "abnormal", "boundary"]:
@@ -319,7 +443,7 @@ def main():
 必须输出JSON格式，不要输出任何其他内容。
 """
             try:
-                testcases = asyncio.run(generate_testcases(task))
+                testcases = asyncio.run(generate_with_feedback(task))
             except Exception as e:
                 st.error(f"AI生成测试用例失败: {str(e)}")
                 return

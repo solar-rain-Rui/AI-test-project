@@ -1,18 +1,6 @@
-# AI辅助接口自动化测试工具
-
-<div align="center">
-
-🤖 **AI-Powered API Testing Tool**
+# AI驱动的接口自动化测试工具
 
 基于大模型的智能测试用例生成与自动化执行工具
-
-[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
-[![Streamlit](https://img.shields.io/badge/Streamlit-1.30+-orange.svg)](https://streamlit.io/)
-[![AutoGen](https://img.shields.io/badge/AutoGen-0.4+-green.svg)](https://microsoft.github.io/autogen/)
-
-</div>
-
----
 
 ##  项目简介
 

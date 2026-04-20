@@ -523,9 +523,34 @@ def get_embedding(text: str) -> list: #将文本转为向量
         return None
 
 #解析Swagger Json，生成接口文本列表
-def parse_swagger_to_docs(file_path: str) -> list:
+def get_swagger_base_url(swagger):
+    """从Swagger解析base_url，支持OpenAPI 3.0和Swagger 2.0"""
+    servers = swagger.get("servers", [])
+    if servers and isinstance(servers, list):
+        first_server = servers[0]
+        if isinstance(first_server, dict):
+            url = first_server.get("url")
+            if url and url.startswith("http"):
+                return url
+    
+    host = swagger.get("host")
+    if host:
+        schemes = swagger.get("schemes", ["https"])
+        scheme = schemes[0] if isinstance(schemes, list) and schemes else "https"
+        base_path = swagger.get("basePath", "")
+        url = f"{scheme}://{host}{base_path}"
+        if url.startswith("http"):
+            return url
+    
+    return None
+
+
+def parse_swagger_to_docs(file_path: str):
+    """解析Swagger文件，返回(docs, base_url)"""
     with open(file_path, "r", encoding="utf-8") as f:
         swagger = json.load(f)
+    
+    base_url = get_swagger_base_url(swagger)
     
     docs = []
     paths = swagger.get("paths", {})
@@ -575,7 +600,9 @@ def parse_swagger_to_docs(file_path: str) -> list:
             })
     
     print(f"[Swagger解析] 共解析 {len(docs)} 个接口")
-    return docs
+    if base_url:
+        print(f"[Swagger解析] base_url: {base_url}")
+    return docs, base_url
 
 #构建FAISS向量索引
 def build_faiss_index(docs: list):
@@ -843,8 +870,150 @@ async def generate_with_feedback(task: str, max_retry: int = 2):
     return last_testcases
 
 
+def postprocess_testcases(testcases, max_cases=10):
+    """用例后处理：去重 + 数量控制"""
+    def get_case_signature(case):
+        """生成用例唯一签名，用于去重"""
+        method = case.get("method", "")
+        path = case.get("path", "")
+        input_data = case.get("input", {})
+        body = {k: v for k, v in input_data.items() if k not in ["headers", "query_params", "path_parameters"]}
+        query = input_data.get("query_params", {})
+        path_params = input_data.get("path_parameters", {})
+        signature = {
+            "method": method,
+            "path": path,
+            "body": json.dumps(body, sort_keys=True, ensure_ascii=False),
+            "query": json.dumps(query, sort_keys=True, ensure_ascii=False),
+            "path_params": json.dumps(path_params, sort_keys=True, ensure_ascii=False)
+        }
+        return json.dumps(signature, sort_keys=True, ensure_ascii=False)
+    
+    result = {"normal": [], "abnormal": [], "boundary": []}
+    seen_signatures = set()
+    total_count = 0
+    
+    for category in ["normal", "abnormal", "boundary"]:
+        cases = testcases.get(category, [])
+        for case in cases:
+            if total_count >= max_cases:
+                break
+            signature = get_case_signature(case)
+            if signature not in seen_signatures:
+                seen_signatures.add(signature)
+                result[category].append(case)
+                total_count += 1
+        if total_count >= max_cases:
+            break
+    
+    original_total = sum(len(testcases.get(k, [])) for k in ["normal", "abnormal", "boundary"])
+    dedup_count = original_total - len(seen_signatures)
+    
+    print(f"[后处理] 原始用例数: {original_total}, 去重: {dedup_count}, 最终: {total_count}")
+    
+    return result
+
+
+def analyze_test_quality(testcases):
+    """用例质量评估：断言完整性 + 场景覆盖 + 字段断言"""
+    def detect_category(case, original_category):
+        """检测用例类型：优先用type字段，其次用名称关键词"""
+        case_type = case.get("type", "")
+        if case_type:
+            if "正常" in case_type or case_type.lower() == "normal":
+                return "normal"
+            elif "异常" in case_type or case_type.lower() == "abnormal":
+                return "abnormal"
+            elif "边界" in case_type or case_type.lower() == "boundary":
+                return "boundary"
+        
+        name = case.get("name", "")
+        if "正常" in name:
+            return "normal"
+        elif "异常" in name:
+            return "abnormal"
+        elif "边界" in name:
+            return "boundary"
+        
+        return original_category
+    
+    all_cases = []
+    for category in ["normal", "abnormal", "boundary"]:
+        for case in testcases.get(category, []):
+            detected_category = detect_category(case, category)
+            all_cases.append((detected_category, case))
+    
+    if not all_cases:
+        print("[质量评估] 无用例可评估")
+        return {"avg_score": 0, "details": [], "category_counts": {"normal": 0, "abnormal": 0, "boundary": 0}}
+    
+    details = []
+    category_counts = {"normal": 0, "abnormal": 0, "boundary": 0}
+    
+    for category, case in all_cases:
+        category_counts[category] = category_counts.get(category, 0) + 1
+        score = 0.0
+        expected = case.get("expected", {})
+        
+        if "status_code" in expected:
+            score += 0.3
+        
+        body_assert = expected.get("body", {})
+        if body_assert:
+            score += 0.3
+            if len(body_assert) > 0:
+                score += 0.2
+        
+        if category in ["abnormal", "boundary"]:
+            score += 0.2
+        
+        score = min(round(score, 2), 1.0)
+        details.append({
+            "name": case.get("name", "未命名"),
+            "category": category,
+            "score": score
+        })
+    
+    avg_score = round(sum(d["score"] for d in details) / len(details), 2)
+    
+    print(f"[质量评估] 平均得分: {avg_score}")
+    print(f"[质量评估] 用例分类统计: normal={category_counts['normal']}, abnormal={category_counts['abnormal']}, boundary={category_counts['boundary']}")
+    for d in details:
+        print(f"  [{d['category']}] {d['name']}: {d['score']}")
+    
+    return {"avg_score": avg_score, "details": details, "category_counts": category_counts}
+
+
+def analyze_test_coverage(testcases, swagger_docs=None):
+    """覆盖率分析：轻量统计（不依赖Swagger）"""
+    all_cases = []
+    for category in ["normal", "abnormal", "boundary"]:
+        for case in testcases.get(category, []):
+            all_cases.append(case)
+    
+    covered_apis = set()
+    for case in all_cases:
+        method = case.get("method", "").upper()
+        path = case.get("path", "")
+        if method and path:
+            covered_apis.add(f"{method} {path}")
+    
+    print(f"[覆盖率] 覆盖接口数: {len(covered_apis)}")
+    for api in covered_apis:
+        print(f"  - {api}")
+    
+    return {
+        "covered_apis": len(covered_apis),
+        "api_list": list(covered_apis)
+    }
+
+
 def generate_pytest_script(testcases, base_url):
-    """将测试用例转换为pytest测试脚本"""
+    """将测试用例转换为pytest测试脚本，确保URL完整"""
+    DEFAULT_BASE_URL = "https://example.com"
+    if not base_url or not base_url.startswith("http"):
+        base_url = DEFAULT_BASE_URL
+    
     script_lines = [
         '#!/usr/bin/env python',
         '# -*- coding: utf-8 -*-',
@@ -855,6 +1024,22 @@ def generate_pytest_script(testcases, base_url):
         f'BASE_URL = "{base_url}"',
         '',
     ]
+    
+    def replace_path_params(path, path_params):
+        """替换URL路径参数，如/pet/{petId} -> /pet/123，确保无未定义变量"""
+        if not path:
+            return path
+        result = path
+        if path_params:
+            for param_name, param_value in path_params.items():
+                placeholder = '{' + param_name + '}'
+                result = result.replace(placeholder, str(param_value))
+        remaining_params = re.findall(r'\{(\w+)\}', result)
+        for param_name in remaining_params:
+            default_value = "1"
+            placeholder = '{' + param_name + '}'
+            result = result.replace(placeholder, default_value)
+        return result
     
     case_index = 0
     for category in ["normal", "abnormal", "boundary"]:
@@ -868,23 +1053,75 @@ def generate_pytest_script(testcases, base_url):
             expected = case.get("expected", {})
             expected_status = expected.get("status_code", 200)
             expected_body = expected.get("body", {})
+            headers = input_data.get("headers", {})
+            query_params = input_data.get("query_params", {})
+            path_params = input_data.get("path_parameters", {})
             
             func_name = f"test_{category}_{case_index}"
             func_name = func_name.replace("-", "_").replace(" ", "_")
             
-            url = f'{{BASE_URL}}{path}' if path else 'BASE_URL'
+            replaced_path = replace_path_params(path, path_params)
+            
+            body_data = {k: v for k, v in input_data.items() 
+                        if k not in ["headers", "query_params", "path_parameters"]}
             
             script_lines.append(f'def {func_name}():')
             script_lines.append(f'    """{name}"""')
-            script_lines.append(f'    url = {url}')
             
-            input_json = json.dumps(input_data, ensure_ascii=False)
-            script_lines.append(f'    payload = {input_json}')
+            if replaced_path:
+                script_lines.append(f'    url = f"{{BASE_URL}}{replaced_path}"')
+            else:
+                script_lines.append(f'    url = BASE_URL')
+            
+            if headers:
+                headers_json = json.dumps(headers, ensure_ascii=False)
+                script_lines.append(f'    headers = {headers_json}')
+            
+            if query_params:
+                params_json = json.dumps(query_params, ensure_ascii=False)
+                script_lines.append(f'    params = {params_json}')
+            
+            if body_data:
+                body_json = json.dumps(body_data, ensure_ascii=False)
+                script_lines.append(f'    payload = {body_json}')
+            
+            script_lines.append(f'    print(f"[请求] Method: {method}, URL: {{url}}")')
+            if headers:
+                script_lines.append(f'    print(f"[请求] Headers: {{headers}}")')
+            if query_params:
+                script_lines.append(f'    print(f"[请求] Query Params: {{params}}")')
+            if body_data:
+                script_lines.append(f'    print(f"[请求] Payload: {{payload}}")')
+            
+            request_args = ["url"]
+            if headers:
+                request_args.append("headers=headers")
+            if query_params:
+                request_args.append("params=params")
+            if body_data and method not in ["GET", "DELETE"]:
+                request_args.append("json=payload")
+            request_args.append("timeout=10")
+            
+            args_str = ", ".join(request_args)
             
             if method == "GET":
-                script_lines.append(f'    response = requests.get(url, params=payload, timeout=10)')
+                script_lines.append(f'    response = requests.get({args_str})')
+            elif method == "POST":
+                script_lines.append(f'    response = requests.post({args_str})')
+            elif method == "PUT":
+                script_lines.append(f'    response = requests.put({args_str})')
+            elif method == "DELETE":
+                script_lines.append(f'    response = requests.delete({args_str})')
+            elif method == "PATCH":
+                script_lines.append(f'    response = requests.patch({args_str})')
             else:
-                script_lines.append(f'    response = requests.{method.lower()}(url, json=payload, timeout=10)')
+                script_lines.append(f'    response = requests.{method.lower()}({args_str})')
+            
+            script_lines.append(f'    print(f"[响应] Status: {{response.status_code}}")')
+            script_lines.append(f'    try:')
+            script_lines.append(f'        print(f"[响应] Body: {{response.json()}}")')
+            script_lines.append(f'    except:')
+            script_lines.append(f'        print(f"[响应] Body: {{response.text}}")')
             
             script_lines.append(f'    assert response.status_code == {expected_status}')
             
@@ -908,10 +1145,12 @@ def main():
         placeholder="例如：用户注册接口，需要用户名、密码、邮箱三个字段..."
     )
     
-    base_url = st.text_input(
-        "🔗 接口Base URL",
-        value="https://petstore.swagger.io/v2",
-        help="接口基础URL，用于拼接完整请求路径"
+    DEFAULT_BASE_URL = "https://petstore.swagger.io/v2"
+    
+    user_base_url = st.text_input(
+        "🔗 接口Base URL（可被Swagger覆盖）",
+        value=DEFAULT_BASE_URL,
+        help="接口基础URL，如提供Swagger文件将自动解析覆盖"
     )
     
     swagger_path = st.text_input(
@@ -929,6 +1168,36 @@ def main():
             st.error("请先在config.ini中配置DeepSeek的API Key！")
             return
         
+        final_base_url = None
+        swagger_base_url = None
+        swagger_docs = None
+        
+        if swagger_path and os.path.exists(swagger_path):
+            with st.spinner("🔍 RAG检索匹配接口..."):
+                try:
+                    docs, swagger_base_url = parse_swagger_to_docs(swagger_path)
+                    swagger_docs = docs
+                    if swagger_base_url:
+                        st.info(f"📌 Swagger解析 base_url: **{swagger_base_url}**")
+                    index, docs = build_faiss_index(docs)
+                    api_info = retrieve_api(task, index, docs)
+                    if api_info:
+                        task = build_rag_prompt(task, api_info)
+                        st.info(f"📌 RAG匹配接口: **{api_info['name']}** ({api_info['method']} {api_info['path']})")
+                    else:
+                        st.warning("RAG未匹配到相关接口，使用原始需求生成")
+                except Exception as e:
+                    st.warning(f"RAG检索失败: {str(e)}，使用原始需求生成")
+        
+        if swagger_base_url and swagger_base_url.startswith("http"):
+            final_base_url = swagger_base_url
+        elif user_base_url and user_base_url.startswith("http"):
+            final_base_url = user_base_url
+        else:
+            final_base_url = DEFAULT_BASE_URL
+        
+        st.info(f"🔗 最终使用的 base_url: **{final_base_url}**")
+        
         with st.spinner("AI正在生成测试用例..."):
             task = f"""
 需求描述: {user_input}
@@ -936,19 +1205,6 @@ def main():
 请生成接口测试用例，包含正常场景、异常场景和边界场景。
 必须输出JSON格式，不要输出任何其他内容。
 """
-            if swagger_path and os.path.exists(swagger_path):
-                with st.spinner("🔍 RAG检索匹配接口..."):
-                    try:
-                        docs = parse_swagger_to_docs(swagger_path)
-                        index, docs = build_faiss_index(docs)
-                        api_info = retrieve_api(task, index, docs)
-                        if api_info:
-                            task = build_rag_prompt(task, api_info)
-                            st.info(f"📌 RAG匹配接口: **{api_info['name']}** ({api_info['method']} {api_info['path']})")
-                        else:
-                            st.warning("RAG未匹配到相关接口，使用原始需求生成")
-                    except Exception as e:
-                        st.warning(f"RAG检索失败: {str(e)}，使用原始需求生成")
             
             try:
                 testcases = asyncio.run(generate_with_feedback(task))
@@ -976,6 +1232,31 @@ def main():
         
         testcases = valid_testcases
         
+        testcases = postprocess_testcases(testcases, max_cases=10)
+        
+        st.subheader("🔧 用例后处理")
+        total_after = sum(len(testcases.get(k, [])) for k in ["normal", "abnormal", "boundary"])
+        st.info(f"去重 + 数量控制后，最终用例数: **{total_after}**")
+        
+        quality_result = analyze_test_quality(testcases)
+        coverage_result = analyze_test_coverage(testcases, swagger_docs)
+        
+        st.subheader("📊 用例质量与覆盖率分析")
+        col_q1, col_q2, col_q3 = st.columns(3)
+        col_q1.metric("质量评分", f"{quality_result['avg_score']}")
+        col_q2.metric("覆盖接口数", f"{coverage_result['covered_apis']}")
+        col_q3.metric("用例分类", f"n={quality_result['category_counts']['normal']}, a={quality_result['category_counts']['abnormal']}, b={quality_result['category_counts']['boundary']}")
+        
+        if quality_result["details"]:
+            with st.expander("📋 用例评分详情", expanded=False):
+                for d in quality_result["details"]:
+                    st.write(f"**[{d['category']}]** {d['name']}: `{d['score']}`")
+        
+        if coverage_result["api_list"]:
+            with st.expander("📋 覆盖接口列表", expanded=False):
+                for api in coverage_result["api_list"]:
+                    st.write(f"- `{api}`")
+        
         json_file_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'test_data.json')
         with open(json_file_path, "w", encoding="utf-8") as f:
             json.dump(testcases, f, ensure_ascii=False, indent=2)
@@ -985,7 +1266,7 @@ def main():
         st.json(testcases)
         
         st.subheader("🐍 生成的pytest测试脚本")
-        pytest_script = generate_pytest_script(testcases, base_url)
+        pytest_script = generate_pytest_script(testcases, final_base_url)
         
         st.code(pytest_script, language="python")
         
@@ -995,7 +1276,7 @@ def main():
         st.success(f"✅ pytest测试脚本已保存到: test_generated.py")
         
         st.subheader("▶️ 运行测试")
-        st.code("pytest test_generated.py -v", language="bash")
+        st.code("pytest test_generated.py -v -s", language="bash")
 
 
 if __name__ == "__main__":

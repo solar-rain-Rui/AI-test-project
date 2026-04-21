@@ -3,7 +3,17 @@
 """
 AI驱动pytest测试脚本生成工具
 功能：输入需求 -> RAG检索接口 -> AI生成测试用例(JSON) -> 生成pytest脚本 -> 保存.py文件
+
+【模块架构】
+├── RAG检索模块: parse_swagger_to_docs, build_faiss_index, retrieve_api, build_rag_prompt
+├── 用例生成模块: generate_testcases, generate_with_feedback
+├── 校验模块: validate_testcases, validate_case
+├── 后处理模块: postprocess_testcases
+├── 质量评估模块: analyze_test_quality
+├── 覆盖率分析模块: analyze_test_coverage
+└── pytest脚本生成模块: generate_pytest_script
 """
+
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 from autogen_agentchat.conditions import TextMentionTermination
 from autogen_agentchat.teams import RoundRobinGroupChat
@@ -48,6 +58,10 @@ model_info = {
 
 
 def get_testcase_writer(model_client, system_message):
+    """
+    创建测试用例生成Agent
+    用于生成符合接口规范的测试用例JSON
+    """
     return AssistantAgent(
         name="testcase_writer",
         model_client=model_client,
@@ -56,6 +70,13 @@ def get_testcase_writer(model_client, system_message):
 
 
 def extract_all_jsons(text: str) -> list:
+    """
+    【JSON解析核心函数】从LLM输出文本中提取所有有效JSON块
+    解决LLM输出不稳定问题，支持多种格式：
+    1. 纯JSON对象/数组
+    2. 代码块包裹的JSON (```json ... ```)
+    3. 混合文本中的JSON片段
+    """
     import re as regex_module
     import json
     
@@ -65,6 +86,7 @@ def extract_all_jsons(text: str) -> list:
     text = text.strip()
     
     def _extract_candidates(source_text):
+        """通过括号匹配提取候选JSON块"""
         candidates = []
         
         brace_depth = 0
@@ -135,6 +157,12 @@ def extract_all_jsons(text: str) -> list:
 
 
 def flatten_cases(data) -> list:
+    """
+    将嵌套的JSON结构扁平化为测试用例列表
+    支持多种输入格式：
+    - 列表格式: [{"name": ..., "input": ..., "expected": ...}]
+    - 分类格式: {"normal": [...], "abnormal": [...], "boundary": [...]}
+    """
     if isinstance(data, list):
         cases = []
         for item in data:
@@ -165,6 +193,10 @@ def flatten_cases(data) -> list:
 
 
 def merge_all_cases(json_list: list) -> dict:
+    """
+    合并多个JSON块的测试用例，按场景分类
+    输出格式: {"normal": [...], "abnormal": [...], "boundary": [...]}
+    """
     all_cases = []
     for json_obj in json_list:
         cases = flatten_cases(json_obj)
@@ -187,6 +219,7 @@ def merge_all_cases(json_list: list) -> dict:
 
 
 def extract_json(text: str) -> str:
+    """提取并合并JSON，返回JSON字符串"""
     import json
     json_list = extract_all_jsons(text)
     if not json_list:
@@ -196,6 +229,10 @@ def extract_json(text: str) -> str:
 
 
 def extract_json_from_response(response_text):
+    """
+    【LLM输出解析入口】从LLM响应中提取并合并测试用例
+    处理流程: 提取JSON块 -> 扁平化 -> 合并分类 -> 返回结构化用例
+    """
     import re as regex_module
     
     if not response_text:
@@ -225,6 +262,11 @@ def extract_json_from_response(response_text):
 
 
 async def generate_testcases(task):
+    """
+    【核心生成函数】多Agent协作生成测试用例
+    架构: testcase_writer(生成) <-> testcase_reviewer(评审)
+    流程: Writer生成JSON -> Reviewer评审 -> APPROVE终止/REJECT继续
+    """
     writer_message = """你是测试用例生成器。你必须且只能输出一个合法的JSON对象。
 【绝对禁止】
 
@@ -440,6 +482,11 @@ async def generate_testcases(task):
 
 
 def validate_testcases(testcases):
+    """
+    【用例校验函数】验证测试用例的结构完整性和逻辑合理性
+    校验项: 必填字段、input非空、expected有效性
+    返回: 有效用例 + 统计信息
+    """
     if not testcases or not isinstance(testcases, dict):
         return {"valid_testcases": {}, "stats": {"original": 0, "valid": 0, "filtered": 0}}
     
@@ -502,7 +549,11 @@ def validate_testcases(testcases):
     return {"valid_testcases": valid_testcases, "stats": stats}
 
 
-def get_embedding(text: str) -> list: #将文本转为向量
+def get_embedding(text: str) -> list:
+    """
+    【RAG模块】调用DeepSeek Embedding API将文本转为向量
+    用于构建FAISS索引和语义检索
+    """
     url = conf['deepseek']['base_url'].rstrip('/')
     if not url.endswith('/embeddings'):
         url = url.rsplit('/', 1)[0] + '/embeddings'
@@ -524,7 +575,10 @@ def get_embedding(text: str) -> list: #将文本转为向量
 
 #解析Swagger Json，生成接口文本列表
 def get_swagger_base_url(swagger):
-    """从Swagger解析base_url，支持OpenAPI 3.0和Swagger 2.0"""
+    """
+    【RAG模块】从Swagger解析base_url
+    支持OpenAPI 3.0 (servers字段) 和 Swagger 2.0 (host + basePath)
+    """
     servers = swagger.get("servers", [])
     if servers and isinstance(servers, list):
         first_server = servers[0]
@@ -546,7 +600,11 @@ def get_swagger_base_url(swagger):
 
 
 def parse_swagger_to_docs(file_path: str):
-    """解析Swagger文件，返回(docs, base_url)"""
+    """
+    【RAG模块】解析Swagger JSON文件，提取接口信息
+    输出: 接口文档列表 + base_url
+    每个接口包含: name, path, method, params, response_fields, text(用于向量化)
+    """
     with open(file_path, "r", encoding="utf-8") as f:
         swagger = json.load(f)
     
@@ -606,6 +664,11 @@ def parse_swagger_to_docs(file_path: str):
 
 #构建FAISS向量索引
 def build_faiss_index(docs: list):
+    """
+    【RAG模块】构建FAISS向量索引
+    流程: 接口文本 -> Embedding向量化 -> FAISS L2索引
+    用于后续语义检索匹配最相关接口
+    """
     if faiss is None:
         print("[FAISS未安装] 跳过向量索引构建")
         return None, docs
@@ -637,6 +700,10 @@ def build_faiss_index(docs: list):
 
 #相似度检索，返回最相关接口
 def retrieve_api(task: str, index, docs, top_k=1):
+    """
+    【RAG模块】语义检索匹配最相关的接口
+    流程: 需求描述 -> 向量化 -> FAISS检索 -> 返回最匹配接口
+    """
     if index is None or faiss is None:
         print("[RAG检索跳过] FAISS索引不可用")
         return None
@@ -662,6 +729,10 @@ def retrieve_api(task: str, index, docs, top_k=1):
 
 #构造增强Prompt，拼接接口信息
 def build_rag_prompt(task: str, api_info: dict) -> str:
+    """
+    【RAG模块】构建增强Prompt，将检索到的接口信息注入
+    约束LLM生成符合接口定义的测试用例
+    """
     if api_info is None:
         return task
     
@@ -685,6 +756,11 @@ def build_rag_prompt(task: str, api_info: dict) -> str:
 
 
 def validate_case(testcases):
+    """
+    【校验模块】深度校验测试用例结构
+    检查项: 空结果、字段完整性、input格式、expected格式
+    返回: 校验结果 + 错误列表
+    """
     if testcases is None:
         return {
             "valid": False,
@@ -762,6 +838,10 @@ def validate_case(testcases):
 
 
 def build_feedback_prompt(task: str, errors: list) -> str:
+    """
+    【自反馈模块】构建错误反馈Prompt
+    将校验错误信息注入Prompt，指导LLM修正生成
+    """
     error_messages = []
     for error in errors:
         error_messages.append(f"- {error['message']}")
@@ -809,6 +889,13 @@ def build_feedback_prompt(task: str, errors: list) -> str:
 
 
 async def generate_with_feedback(task: str, max_retry: int = 2):
+    """
+    【自反馈生成函数】带重试机制的测试用例生成
+    流程:
+    1. 第一轮: 正常生成
+    2. 校验失败 -> 第二轮: 强化约束Prompt重新生成
+    3. 返回最后一次有效结果
+    """
     original_task = task
     retry_count = 0
     last_testcases = None
@@ -871,9 +958,13 @@ async def generate_with_feedback(task: str, max_retry: int = 2):
 
 
 def postprocess_testcases(testcases, max_cases=10):
-    """用例后处理：去重 + 数量控制"""
+    """
+    【后处理模块】用例去重 + 数量控制
+    去重策略: 基于method+path+input生成签名，过滤重复用例
+    数量控制: 限制最大用例数，避免生成过多用例
+    """
     def get_case_signature(case):
-        """生成用例唯一签名，用于去重"""
+        """生成用例唯一签名，用于去重判断"""
         method = case.get("method", "")
         path = case.get("path", "")
         input_data = case.get("input", {})
@@ -915,7 +1006,13 @@ def postprocess_testcases(testcases, max_cases=10):
 
 
 def analyze_test_quality(testcases):
-    """用例质量评估：断言完整性 + 场景覆盖 + 字段断言"""
+    """
+    【质量评估模块】评估测试用例质量
+    评分维度:
+    1. 断言完整性: status_code(0.3分) + body断言(0.5分)
+    2. 场景覆盖: abnormal/boundary额外加分(0.2分)
+    输出: 平均评分 + 分类统计 + 用例详情
+    """
     def detect_category(case, original_category):
         """检测用例类型：优先用type字段，其次用名称关键词"""
         case_type = case.get("type", "")
@@ -985,7 +1082,10 @@ def analyze_test_quality(testcases):
 
 
 def analyze_test_coverage(testcases, swagger_docs=None):
-    """覆盖率分析：轻量统计（不依赖Swagger）"""
+    """
+    【覆盖率分析模块】统计测试用例覆盖的API接口
+    轻量统计: 基于用例中的method+path计算覆盖接口数
+    """
     all_cases = []
     for category in ["normal", "abnormal", "boundary"]:
         for case in testcases.get(category, []):
@@ -1009,7 +1109,13 @@ def analyze_test_coverage(testcases, swagger_docs=None):
 
 
 def generate_pytest_script(testcases, base_url):
-    """将测试用例转换为pytest测试脚本，确保URL完整"""
+    """
+    【pytest脚本生成模块】将JSON测试用例转换为可执行的pytest脚本
+    处理内容:
+    1. URL路径参数替换 (如 /pet/{petId} -> /pet/123)
+    2. HTTP请求构造 (GET/POST/PUT/DELETE/PATCH)
+    3. 断言生成 (status_code + body字段)
+    """
     DEFAULT_BASE_URL = "https://example.com"
     if not base_url or not base_url.startswith("http"):
         base_url = DEFAULT_BASE_URL
@@ -1026,7 +1132,11 @@ def generate_pytest_script(testcases, base_url):
     ]
     
     def replace_path_params(path, path_params):
-        """替换URL路径参数，如/pet/{petId} -> /pet/123，确保无未定义变量"""
+        """
+        替换URL路径参数
+        如 /pet/{petId} -> /pet/123
+        未定义参数使用默认值1
+        """
         if not path:
             return path
         result = path
@@ -1135,6 +1245,15 @@ def generate_pytest_script(testcases, base_url):
 
 
 def main():
+    """
+    【主入口函数】Streamlit Web应用主流程
+    完整流程:
+    1. 用户输入需求描述 + 可选Swagger文件
+    2. RAG检索匹配接口（可选）
+    3. 多Agent协作生成测试用例
+    4. 校验 -> 后处理 -> 质量评估
+    5. 生成pytest脚本并保存
+    """
     st.title("🤖 AI驱动pytest测试脚本生成工具")
     st.markdown("**测试闭环**: 输入需求 → RAG检索接口 → AI生成测试用例(JSON) → 生成pytest脚本 → 保存.py文件")
     st.divider()

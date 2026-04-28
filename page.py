@@ -15,8 +15,6 @@ AI驱动pytest测试脚本生成工具
 """
 
 from autogen_ext.models.openai import OpenAIChatCompletionClient
-from autogen_agentchat.conditions import TextMentionTermination
-from autogen_agentchat.teams import RoundRobinGroupChat
 from autogen_agentchat.agents import AssistantAgent
 from configparser import ConfigParser
 import streamlit as st
@@ -438,36 +436,47 @@ async def generate_testcases(task):
         system_message=reviewer_message,
     )
     
-    termination = TextMentionTermination("APPROVE")
-    team = RoundRobinGroupChat(
-        participants=[testcase_writer, testcase_reviewer],
-        termination_condition=termination,
-        max_turns=2
-    )
+    max_turns = 2
+    current_turn = 1
+    messages = [{"role": "user", "content": task}]
     
     full_response = ""
     review_result = ""
+    last_writer_reply = ""
     
-    async for chunk in team.run_stream(task=task):
-        if hasattr(chunk, 'content') and hasattr(chunk, 'type'):
-            chunk_type = getattr(chunk, 'type', None)
-            content = getattr(chunk, 'content', '')
+    while current_turn <= max_turns:
+        print(f"\n[第{current_turn}轮] Writer生成测试用例...")
+        
+        writer_reply = await testcase_writer.generate_reply(messages=messages)
+        last_writer_reply = writer_reply
+        full_response += writer_reply
+        
+        print(f"[第{current_turn}轮] Reviewer评审中...")
+        
+        reviewer_reply = await testcase_reviewer.generate_reply(
+            messages=[{"role": "user", "content": f"请评审以下测试用例：\n{writer_reply}"}]
+        )
+        full_response += "\n" + reviewer_reply
+        
+        if "APPROVE" in reviewer_reply:
+            review_result = reviewer_reply
+            print(f"[第{current_turn}轮] ✅ APPROVE - 评审通过")
+            break
+        elif "REJECT" in reviewer_reply:
+            review_result = reviewer_reply
+            print(f"[第{current_turn}轮] ❌ REJECT - 需要修正")
             
-            if chunk_type == 'ModelClientStreamingChunkEvent':
-                full_response += content
-            elif hasattr(chunk, 'messages'):
-                messages = getattr(chunk, 'messages', [])
-                for msg in messages:
-                    if hasattr(msg, 'content'):
-                        msg_content = getattr(msg, 'content', '')
-                        if msg_content and isinstance(msg_content, str):
-                            full_response += msg_content
-                            if "APPROVE" in msg_content or "REJECT" in msg_content:
-                                review_result = msg_content
-            elif content and isinstance(content, str):
-                full_response += content
-        elif isinstance(chunk, str):
-            full_response += chunk
+            if current_turn < max_turns:
+                messages.append({
+                    "role": "user",
+                    "content": f"请修复以下问题并重新生成测试用例：\n{reviewer_reply}"
+                })
+        else:
+            review_result = reviewer_reply
+            print(f"[第{current_turn}轮] ⚠️ 未明确判定，结束流程")
+            break
+        
+        current_turn += 1
     
     print("\n" + "="*50)
     print("【LLM原始输出】")
@@ -566,9 +575,9 @@ def get_embedding(text: str) -> list:
         "input": text
     }
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        response = requests.post(url, headers=headers, json=payload, timeout=30)#向 DeepSeek 的 Embedding 服务发送请求，超时时间 30 秒。
         result = response.json()
-        return result["data"][0]["embedding"]
+        return result["data"][0]["embedding"] #返回全部的向量，一堆浮点数的列表
     except Exception as e:
         print(f"[Embedding失败] {e}")
         return None
@@ -606,48 +615,48 @@ def parse_swagger_to_docs(file_path: str):
     每个接口包含: name, path, method, params, response_fields, text(用于向量化)
     """
     with open(file_path, "r", encoding="utf-8") as f:
-        swagger = json.load(f)
+        swagger = json.load(f) #把json文件解析成字典/列表
     
-    base_url = get_swagger_base_url(swagger)
+    base_url = get_swagger_base_url(swagger) #提取出url
     
     docs = []
     paths = swagger.get("paths", {})
     
-    for path, methods in paths.items():
+    for path, methods in paths.items():#循环遍历
         for method, detail in methods.items():
             if method.lower() not in ["get", "post", "put", "delete", "patch"]:
-                continue
+                continue #只处理常见的5中http方法
             
             name = detail.get("summary", detail.get("operationId", path))
-            
+            #确定接口可读名称  优先级：summary(中文描述) > operationId(函数名) > path(路径名)
             params = []
-            parameters = detail.get("parameters", [])
+            parameters = detail.get("parameters", []) #获取路径参数，查询参数等
             for p in parameters:
                 param_name = p.get("name", "")
                 param_in = p.get("in", "")
                 params.append(f"{param_name}({param_in})")
             
-            request_body = detail.get("requestBody", {})
+            request_body = detail.get("requestBody", {})#处理POST/PUT 等方法特有的 requestBody（请求体）
             if request_body:
                 content = request_body.get("content", {})
                 for content_type, schema_info in content.items():
                     schema = schema_info.get("schema", {})
                     properties = schema.get("properties", {})
-                    for prop_name in properties:
+                    for prop_name in properties:# 遍历请求体里的每一个字段名，并标注为 (body)
                         params.append(f"{prop_name}(body)")
             
-            responses = detail.get("responses", {})
+            responses = detail.get("responses", {})# 处理返回结果（Responses）
             resp_fields = []
-            for status_code, resp in responses.items():
+            for status_code, resp in responses.items(): #遍历状态码和对应响应内容
                 resp_content = resp.get("content", {})
                 for ct, schema_info in resp_content.items():
                     schema = schema_info.get("schema", {})
                     props = schema.get("properties", {})
-                    for prop_name in props:
+                    for prop_name in props:# 提取返回结果中定义的字段名
                         resp_fields.append(prop_name)
             
             text = f"接口: {name} | 路径: {path} | 方法: {method.upper()} | 参数: {','.join(params) if params else '无'} | 返回: {','.join(resp_fields) if resp_fields else '无'}"
-            
+            #把每个接口的所有信息打包成一个字典，存进 docs 列表里
             docs.append({
                 "name": name,
                 "path": path,
@@ -673,11 +682,11 @@ def build_faiss_index(docs: list):
         print("[FAISS未安装] 跳过向量索引构建")
         return None, docs
     
-    texts = [doc["text"] for doc in docs]
+    texts = [doc["text"] for doc in docs] #拿出每个接口的描述文本
     embeddings = []
-    
+    #遍历文本并生成向量
     for i, text in enumerate(texts):
-        emb = get_embedding(text)
+        emb = get_embedding(text) #把接口文本转换成向量，让语义相似的接口在向量空间里更接近
         if emb is not None:
             embeddings.append(emb)
         else:
@@ -687,16 +696,16 @@ def build_faiss_index(docs: list):
         print("[FAISS构建失败] 无有效向量")
         return None, docs
     
-    embedding_matrix = np.array(embeddings, dtype=np.float32)
+    embedding_matrix = np.array(embeddings, dtype=np.float32) #转换为numpy矩阵(构建向量矩阵)
     
-    dimension = embedding_matrix.shape[1]
-    index = faiss.IndexFlatL2(dimension)
-    index.add(embedding_matrix)
-    
+    dimension = embedding_matrix.shape[1] #获取向量的维度
+    index = faiss.IndexFlatL2(dimension)#创建 FAISS 索引，使用 L2 距离（欧式距离） 来衡量向量之间相似度
+    index.add(embedding_matrix) #把所有接口向量存进索引里，构建可检索的数据结构
+    #FAISS索引 ≈ 轻量向量数据库（功能上）它既存向量，又负责检索
     valid_docs = [docs[i] for i in range(len(docs)) if i < len(embeddings)]
     
     print(f"[FAISS索引构建] 维度: {dimension}, 接口数: {len(valid_docs)}")
-    return index, valid_docs
+    return index, valid_docs #返回索引和对应接口信息，用于后续RAG检索最相关接口
 
 #相似度检索，返回最相关接口
 def retrieve_api(task: str, index, docs, top_k=1):
@@ -708,24 +717,25 @@ def retrieve_api(task: str, index, docs, top_k=1):
         print("[RAG检索跳过] FAISS索引不可用")
         return None
     
-    query_emb = get_embedding(task)
+    query_emb = get_embedding(task) #输入的需求描述转成向量
     if query_emb is None:
         print("[RAG检索失败] 查询向量化失败")
         return None
     
-    query_vector = np.array([query_emb], dtype=np.float32)
-    distances, indices = index.search(query_vector, min(top_k, len(docs)))
+    query_vector = np.array([query_emb], dtype=np.float32) #生成一个形状为 (1, 1024) 的二维矩阵
+    #使用FAISS进行向量相似度搜索，返回最接近的接口索引和对应距离
+    distances, indices = index.search(query_vector, min(top_k, len(docs))) #在所有接口向量里，找最相似的前k个
     
     results = []
     for i in range(len(indices[0])):
         idx = indices[0][i]
         if idx < len(docs):
-            doc = docs[idx]
-            doc["score"] = float(distances[0][i])
+            doc = docs[idx] #根据索引，找到对应的接口信息（路径、名字等）
+            doc["score"] = float(distances[0][i]) #给这个接口打一个“相似度分数”
             results.append(doc)
             print(f"[RAG检索] 匹配接口: {doc['name']} | 路径: {doc['path']} | 距离: {doc['score']:.4f}")
     
-    return results[0] if results else None
+    return results[0] if results else None #最终返回最匹配的接口作为RAG上下文
 
 #构造增强Prompt，拼接接口信息
 def build_rag_prompt(task: str, api_info: dict) -> str:
@@ -733,12 +743,13 @@ def build_rag_prompt(task: str, api_info: dict) -> str:
     【RAG模块】构建增强Prompt，将检索到的接口信息注入
     约束LLM生成符合接口定义的测试用例
     """
+    #把检索到的接口信息拼进Prompt里，用来约束大模型生成更准确的测试用例
     if api_info is None:
         return task
-    
+    #提取了请求参数，返回字段
     params_str = ", ".join(api_info.get("params", [])) if api_info.get("params") else "无"
     resp_str = ", ".join(api_info.get("response_fields", [])) if api_info.get("response_fields") else "无"
-    
+    #构建rag上下文(将接口定义转化为结构化上下文，作为模型生成的约束条件)；在prompt中增加明确约束，引导模型输出符合接口规范的测试用例
     rag_context = f"""
 【接口信息（来自Swagger文档）】
 接口名称: {api_info.get('name', '未知')}
@@ -752,7 +763,7 @@ def build_rag_prompt(task: str, api_info: dict) -> str:
 2. 覆盖正常、异常、边界三种场景
 3. 输出纯JSON格式
 """
-    return rag_context + "\n原始需求: " + task
+    return rag_context + "\n原始需求: " + task #拼接上原来的需求
 
 
 def validate_case(testcases):
@@ -896,15 +907,17 @@ async def generate_with_feedback(task: str, max_retry: int = 2):
     2. 校验失败 -> 第二轮: 强化约束Prompt重新生成
     3. 返回最后一次有效结果
     """
+    #初始化
     original_task = task
     retry_count = 0
     last_testcases = None
-    
+    #进入循环，最多两轮
     while retry_count < max_retry:
         print(f"\n{'='*50}")
         print(f"[第{retry_count + 1}轮生成] 开始生成测试用例...")
         print(f"{'='*50}")
-        
+        #第二轮加强化约束：给prompt加了一堆“强制规则”
+        #如果第一轮生成不合格，会在第二轮中增强prompt约束，引导模型生成更规范的结果
         current_task = task
         if retry_count == 1:
             print("[第2轮] 使用强化约束prompt...")
@@ -922,8 +935,8 @@ async def generate_with_feedback(task: str, max_retry: int = 2):
 如果输出不是JSON，将视为失败
 """
         
-        testcases = await generate_testcases(current_task)
-        
+        testcases = await generate_testcases(current_task) #调用LLM模型生成用例
+        #校验结构是否正常
         if testcases is None:
             print(f"[第{retry_count + 1}轮生成] ⚠️ 无法提取有效JSON，触发下一轮")
             retry_count += 1
@@ -933,10 +946,10 @@ async def generate_with_feedback(task: str, max_retry: int = 2):
             print(f"[第{retry_count + 1}轮生成] ⚠️ 空JSON，触发下一轮")
             retry_count += 1
             continue
-        
+        #统计用例数量
         total = sum(len(testcases.get(k, [])) for k in ["normal", "abnormal", "boundary"])
         print(f"[第{retry_count + 1}轮生成] 提取到 {total} 个测试用例")
-        
+        #第二层校验：检查字段，格式
         validation_result = validate_case(testcases)
         
         if validation_result["valid"]:
@@ -954,7 +967,7 @@ async def generate_with_feedback(task: str, max_retry: int = 2):
     else:
         print(f"[返回结果] 无有效测试用例")
     print(f"{'='*50}")
-    return last_testcases
+    return last_testcases #不完美也返回结果
 
 
 def postprocess_testcases(testcases, max_cases=10):
@@ -1294,7 +1307,7 @@ def main():
         if swagger_path and os.path.exists(swagger_path):
             with st.spinner("🔍 RAG检索匹配接口..."):
                 try:
-                    docs, swagger_base_url = parse_swagger_to_docs(swagger_path)
+                    docs, swagger_base_url = parse_swagger_to_docs(swagger_path) #取到解析后的docs列表和接口的基础url
                     swagger_docs = docs
                     if swagger_base_url:
                         st.info(f"📌 Swagger解析 base_url: **{swagger_base_url}**")

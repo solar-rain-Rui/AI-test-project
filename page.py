@@ -1,33 +1,75 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
 """
-AI驱动pytest测试脚本生成工具
-功能：输入需求 -> RAG检索接口 -> AI生成测试用例(JSON) -> 生成pytest脚本 -> 保存.py文件
+AI驱动测试用例生成平台
+功能：输入需求 -> RAG检索接口 -> PromptTemplate构建 -> AI生成测试用例(JSON) -> 输出结构化JSON文件
+
+【项目定位】
+  本项目是"基于RAG + Multi-Agent的AI测试用例生成平台"，而非自动化执行平台。
+  最终输出为结构化JSON测试用例文件，便于：
+  1. 后续对接不同测试框架（pytest、JUnit、TestNG等）
+  2. 人工审核和修改
+  3. 测试用例管理系统导入
+  4. 跨团队、跨语言复用
+
+【为什么输出JSON而非pytest脚本】
+  JSON是中间标准格式，具有以下优势：
+  1. 框架无关性：不绑定特定测试框架，可转换为任意格式
+  2. 可读性强：结构清晰，便于人工审核和修改
+  3. 易于扩展：新增字段不影响现有解析逻辑
+  4. 便于集成：可直接导入测试用例管理系统
+  5. 支持多语言：Python/Java/JavaScript等均可解析
+
+【JSON测试用例结构说明】
+  {
+    "title": "用例标题",
+    "method": "HTTP方法(GET/POST/PUT/DELETE/PATCH)",
+    "path": "接口路径(如/pet/{petId})",
+    "params": {
+      "path": {"petId": 123},      # 路径参数
+      "query": {"status": "sold"}, # 查询参数
+      "body": {"name": "test"}     # 请求体参数
+    },
+    "expected": {
+      "status_code": 200,          # 期望HTTP状态码
+      "body": {"code": 0}          # 期望响应体字段
+    },
+    "case_type": "正常场景/异常场景/边界场景"
+  }
 
 【模块架构】
-├── RAG检索模块: parse_swagger_to_docs, build_faiss_index, retrieve_api, build_rag_prompt
+├── RAG检索模块(rag/): chunker, embedder, retriever, reranker, pipeline
+├── Prompt模板模块(prompt/): template
 ├── 用例生成模块: generate_testcases, generate_with_feedback
 ├── 校验模块: validate_testcases, validate_case
 ├── 后处理模块: postprocess_testcases
 ├── 质量评估模块: analyze_test_quality
 ├── 覆盖率分析模块: analyze_test_coverage
-└── pytest脚本生成模块: generate_pytest_script
+└── JSON输出模块: generate_json_testcases, save_json_file
 """
 
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 from autogen_agentchat.agents import AssistantAgent
 from configparser import ConfigParser
+from rag.pipeline import RAGPipeline
+from prompt.template import build_prompt
 import streamlit as st
 import asyncio
 import requests
 import json
 import re
 import os
+import logging
 import numpy as np
 try:
     import faiss
 except ImportError:
     faiss = None
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s"
+)
 
 st.set_page_config(
     page_title="AI辅助接口自动化测试工具",
@@ -1121,6 +1163,100 @@ def analyze_test_coverage(testcases, swagger_docs=None):
     }
 
 
+def generate_json_testcases(testcases, base_url=None):
+    """
+    【JSON输出模块】将分类测试用例转换为标准化JSON格式
+    
+    为什么需要标准化JSON输出:
+      1. 框架无关性：不绑定pytest，可转换为任意测试框架格式
+      2. 便于审核：结构清晰，测试人员可直接阅读和修改
+      3. 易于集成：可导入测试用例管理系统（如TestLink、Zephyr等）
+      4. 支持扩展：新增字段不影响现有解析逻辑
+    
+    JSON字段说明:
+      - title: 用例标题，简洁描述测试场景
+      - method: HTTP方法（GET/POST/PUT/DELETE/PATCH）
+      - path: 接口路径，支持路径参数占位符（如/pet/{petId}）
+      - params: 请求参数，分为path/query/body三类
+      - expected: 期望结果，包含status_code和body断言
+      - case_type: 用例类型（正常场景/异常场景/边界场景）
+    
+    输入: 分类测试用例 {"normal": [...], "abnormal": [...], "boundary": [...]}
+    输出: 标准化JSON列表
+    """
+    standard_cases = []
+    
+    case_type_mapping = {
+        "normal": "正常场景",
+        "abnormal": "异常场景",
+        "boundary": "边界场景"
+    }
+    
+    for category in ["normal", "abnormal", "boundary"]:
+        cases = testcases.get(category, [])
+        for case in cases:
+            name = case.get("name", "未命名用例")
+            method = case.get("method", "POST").upper()
+            path = case.get("path", "")
+            input_data = case.get("input", {})
+            expected = case.get("expected", {})
+            
+            params = {
+                "path": input_data.get("path_parameters", {}),
+                "query": input_data.get("query_params", {}),
+                "body": {k: v for k, v in input_data.items() 
+                        if k not in ["headers", "query_params", "path_parameters"]}
+            }
+            
+            if not params["path"]:
+                del params["path"]
+            if not params["query"]:
+                del params["query"]
+            if not params["body"]:
+                del params["body"]
+            
+            expected_body = expected.get("body", {})
+            if isinstance(expected_body, str):
+                expected_body = {}
+            
+            standard_case = {
+                "title": name,
+                "method": method,
+                "path": path,
+                "params": params if params else {},
+                "expected": {
+                    "status_code": expected.get("status_code", 200),
+                    "body": expected_body
+                },
+                "case_type": case_type_mapping.get(category, category)
+            }
+            
+            standard_cases.append(standard_case)
+    
+    return standard_cases
+
+
+def save_json_file(testcases, file_path=None):
+    """
+    【JSON输出模块】保存测试用例到JSON文件
+    
+    为什么单独封装保存逻辑:
+      1. 统一编码处理：确保UTF-8编码，支持中文
+      2. 统一格式化：indent=2保证可读性
+      3. 便于扩展：后续可增加文件名校验、覆盖确认等逻辑
+    
+    输入: 测试用例列表, 目标文件路径
+    输出: 实际保存的文件路径
+    """
+    if file_path is None:
+        file_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'testcases.json')
+    
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(testcases, f, ensure_ascii=False, indent=2)
+    
+    return file_path
+
+
 def generate_pytest_script(testcases, base_url):
     """
     【pytest脚本生成模块】将JSON测试用例转换为可执行的pytest脚本
@@ -1263,12 +1399,12 @@ def main():
     完整流程:
     1. 用户输入需求描述 + 可选Swagger文件
     2. RAG检索匹配接口（可选）
-    3. 多Agent协作生成测试用例
+    3. Multi-Agent协作生成测试用例
     4. 校验 -> 后处理 -> 质量评估
-    5. 生成pytest脚本并保存
+    5. 输出标准化JSON测试用例文件
     """
-    st.title("🤖 AI驱动pytest测试脚本生成工具")
-    st.markdown("**测试闭环**: 输入需求 → RAG检索接口 → AI生成测试用例(JSON) → 生成pytest脚本 → 保存.py文件")
+    st.title("🤖 AI测试用例生成平台")
+    st.markdown("**生成流程**: 输入需求 → RAG检索接口 → AI生成测试用例 → 输出JSON文件")
     st.divider()
     
     user_input = st.text_area(
@@ -1291,7 +1427,7 @@ def main():
         help="上传Swagger JSON文件路径，启用RAG接口匹配"
     )
     
-    if st.button("🚀 生成pytest测试脚本", type="primary"):
+    if st.button("🚀 生成测试用例", type="primary"):
         if not user_input:
             st.error("请输入需求描述！")
             return
@@ -1305,16 +1441,19 @@ def main():
         swagger_docs = None
         
         if swagger_path and os.path.exists(swagger_path):
-            with st.spinner("🔍 RAG检索匹配接口..."):
+            with st.spinner("🔍 RAG检索匹配接口（Hybrid Search + Rerank）..."):
                 try:
-                    docs, swagger_base_url = parse_swagger_to_docs(swagger_path) #取到解析后的docs列表和接口的基础url
-                    swagger_docs = docs
+                    pipeline = RAGPipeline(
+                        base_url=conf['deepseek']['base_url'],
+                        api_key=conf['deepseek']['api_key']
+                    )
+                    api_info = pipeline.run(swagger_path, user_input, top_k=3)
+                    swagger_base_url = pipeline.base_url
+                    swagger_docs = pipeline.docs
                     if swagger_base_url:
                         st.info(f"📌 Swagger解析 base_url: **{swagger_base_url}**")
-                    index, docs = build_faiss_index(docs)
-                    api_info = retrieve_api(task, index, docs)
                     if api_info:
-                        task = build_rag_prompt(task, api_info)
+                        task = build_prompt(api_info, task)
                         st.info(f"📌 RAG匹配接口: **{api_info['name']}** ({api_info['method']} {api_info['path']})")
                     else:
                         st.warning("RAG未匹配到相关接口，使用原始需求生成")
@@ -1394,21 +1533,33 @@ def main():
             json.dump(testcases, f, ensure_ascii=False, indent=2)
         st.info(f"✅ 测试用例已保存到: test_data.json")
         
-        st.subheader("📋 AI生成的测试用例(JSON)")
-        st.json(testcases)
+        standard_testcases = generate_json_testcases(testcases, final_base_url)
         
-        st.subheader("🐍 生成的pytest测试脚本")
-        pytest_script = generate_pytest_script(testcases, final_base_url)
+        st.subheader("� 生成的标准化测试用例(JSON)")
+        st.json(standard_testcases)
         
-        st.code(pytest_script, language="python")
+        json_output_path = save_json_file(standard_testcases)
+        st.success(f"✅ 测试用例已保存到: **{json_output_path}**")
         
-        script_file_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'test_generated.py')
-        with open(script_file_path, "w", encoding="utf-8") as f:
-            f.write(pytest_script)
-        st.success(f"✅ pytest测试脚本已保存到: test_generated.py")
-        
-        st.subheader("▶️ 运行测试")
-        st.code("pytest test_generated.py -v -s", language="bash")
+        st.subheader("📁 JSON文件说明")
+        st.markdown("""
+**输出文件**: `testcases.json`
+
+**字段说明**:
+| 字段 | 说明 |
+|------|------|
+| title | 用例标题，描述测试场景 |
+| method | HTTP方法（GET/POST/PUT/DELETE/PATCH） |
+| path | 接口路径 |
+| params | 请求参数（path/query/body） |
+| expected | 期望结果（status_code + body） |
+| case_type | 用例类型（正常场景/异常场景/边界场景） |
+
+**后续使用**:
+- 可导入测试用例管理系统
+- 可转换为pytest/JUnit等测试脚本
+- 可用于API自动化测试框架
+""")
 
 
 if __name__ == "__main__":

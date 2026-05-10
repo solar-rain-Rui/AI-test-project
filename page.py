@@ -43,16 +43,18 @@ AI驱动测试用例生成平台
 ├── 用例生成模块: generate_testcases, generate_with_feedback
 ├── 校验模块: validate_testcases, validate_case
 ├── 后处理模块: postprocess_testcases
-├── 质量评估模块: analyze_test_quality
-├── 覆盖率分析模块: analyze_test_coverage
+├── 质量评估模块(quality/): evaluator
 └── JSON输出模块: generate_json_testcases, save_json_file
 """
 
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 from autogen_agentchat.agents import AssistantAgent
+from autogen_agentchat.messages import TextMessage
+from autogen_core import CancellationToken
 from configparser import ConfigParser
 from rag.pipeline import RAGPipeline
-from prompt.template import build_prompt
+from prompt.template import build_prompt, build_reviewer_prompt, build_retry_prompt, build_reject_retry_prompt
+from quality.evaluator import evaluate_testcases
 import streamlit as st
 import asyncio
 import requests
@@ -301,163 +303,38 @@ def extract_json_from_response(response_text):
     return result
 
 
-async def generate_testcases(task):
+async def generate_testcases(task, base_prompt=""):
     """
     【核心生成函数】多Agent协作生成测试用例
     架构: testcase_writer(生成) <-> testcase_reviewer(评审)
     流程: Writer生成JSON -> Reviewer评审 -> APPROVE终止/REJECT继续
+
+    为什么使用base_prompt而非rag_context:
+      base_prompt是build_prompt构建的完整基础Prompt，包含:
+      1. ROLE_DEFINITION - 角色定义
+      2. RAG上下文 - 接口定义信息
+      3. TASK_DESCRIPTION - 任务说明
+      4. OUTPUT_FORMAT - 输出格式约束
+      5. OUTPUT_EXAMPLE - 输出示例
+      使用base_prompt作为Writer的system_message，确保Writer始终基于完整Prompt结构工作。
+      REJECT retry和JSON校验retry时，也基于同一份base_prompt追加约束，不丢失原始结构。
+
+    为什么不能覆盖增强后的Prompt:
+      之前的实现中，task变量在多处被重新赋值，导致RAG上下文丢失。
+      现在base_prompt作为独立参数传入，与task分离维护，
+      确保基础Prompt在整个Agent协作流程中始终存在，retry只追加约束。
+
+    输入:
+      task: 用户需求（作为user message传给Writer）
+      base_prompt: 基础Prompt（来自build_prompt，作为system_message）
     """
-    writer_message = """你是测试用例生成器。你必须且只能输出一个合法的JSON对象。
-【绝对禁止】
-
-* 禁止输出任何解释、说明、注释
-* 禁止使用代码块标记 `json 或 `
-* 禁止使用任何代码表达式
-* 禁止输出伪代码或占位符
-* 禁止编造接口路径、参数、返回字段
-
----
-
-【必须遵守】
-
-1. 输出必须是单个JSON对象，无任何其他内容
-
-2. 每个用例必须包含以下字段：
-
-* name（用例名称）
-* path（接口路径）
-* method（HTTP方法，如GET/POST）
-* input（请求参数，必须是对象）
-* expected（结构化断言对象）
-
----
-
-3. input要求：
-
-* 必须严格来自接口参数定义
-* 不允许新增不存在的字段
-
----
-
-4. expected要求（必须是结构化对象）：
-
-格式如下：
-
-{
-"status_code": 200,
-"body": {
-"字段名": "期望值"
-}
-}
-
-说明：
-
-* status_code为HTTP状态码
-* body中只包含需要校验的关键字段
-* 不允许使用“成功/失败”等模糊描述
-
----
-
-5. 必须严格基于提供的接口信息：
-
-* path必须与接口信息一致
-* method必须正确
-* 参数必须来自接口定义
-* 返回字段必须来自接口定义
-
----
-
-6. 如果接口信息不足以生成完整用例，请输出空JSON对象 {}
-
----
-
----
-
-【输出示例】
-
-{
-"normal": [
-{
-"name": "正常注册",
-"path": "/register",
-"method": "POST",
-"input": {
-"username": "testuser",
-"password": "Pass1234"
-},
-"expected": {
-"status_code": 200,
-"body": {
-"code": 0,
-"msg": "success"
-}
-}
-}
-],
-"abnormal": [],
-"boundary": []
-}
-
----
-
-现在请根据需求和提供的接口信息生成测试用例JSON：
-"""
+    writer_message = base_prompt if base_prompt else task
     
-    reviewer_message = """你是测试用例评审专家。
-
----
-
-【重要前提】
-
-如果当前没有提供接口定义信息（如Swagger、接口参数说明、返回结构等）：
-
-- 跳过“接口一致性校验”
-- 只进行结构校验和基本合理性校验
-
----
-
-【评审标准】
-
-1. 用例结构校验：
-
-* 必须包含：
-  name、path、method、input、expected
-
-2. expected结构：
-
-* 必须包含：
-  status_code（整数）
-  body（对象）
-
-3. 基本合理性：
-
-* 不存在明显逻辑错误（如空参数却期望成功）
-
----
-
-【仅在提供接口定义时才执行】
-
-4. 接口一致性校验：
-
-* path必须存在
-* method必须正确
-* 参数必须来自接口定义
-* 返回字段必须来自接口定义
-
----
-
-【判定规则】
-
-* 缺少结构字段 → REJECT
-* expected不是结构化 → REJECT
-* 否则 → APPROVE
-
----
-
-注意：
-如果没有接口定义，不允许因为“无法校验”而REJECT
-
-"""
+    rag_context_for_reviewer = ""
+    if base_prompt and "接口信息" in base_prompt:
+        rag_context_for_reviewer = base_prompt
+    
+    reviewer_message = build_reviewer_prompt(rag_context_for_reviewer)
     
     model_client = OpenAIChatCompletionClient(
         model=conf['deepseek']['model'],
@@ -478,9 +355,34 @@ async def generate_testcases(task):
         system_message=reviewer_message,
     )
     
+    """
+    【AutoGen 0.4.x API变化说明】
+    
+    为什么generate_reply不可用:
+      AutoGen 0.4.x版本进行了重大架构重构，采用异步事件驱动架构。
+      旧版0.2.x的generate_reply方法已被移除，不再支持。
+    
+    当前版本AutoGen正确调用方式:
+      1. 使用on_messages()方法替代generate_reply()
+      2. on_messages是异步方法，需要await
+      3. 需要传入TextMessage列表和CancellationToken
+      4. Agent是有状态的，自动维护对话历史
+      5. 每次调用只需传入新消息，不需要传入完整历史
+      6. 返回Response对象，通过response.chat_message.content获取内容
+    
+    示例:
+      cancellation_token = CancellationToken()
+      response = await agent.on_messages(
+          [TextMessage(content="任务内容", source="user")],
+          cancellation_token
+      )
+      content = response.chat_message.content
+    """
+    
+    cancellation_token = CancellationToken()
+    
     max_turns = 2
     current_turn = 1
-    messages = [{"role": "user", "content": task}]
     
     full_response = ""
     review_result = ""
@@ -489,15 +391,24 @@ async def generate_testcases(task):
     while current_turn <= max_turns:
         print(f"\n[第{current_turn}轮] Writer生成测试用例...")
         
-        writer_reply = await testcase_writer.generate_reply(messages=messages)
+        writer_response = await testcase_writer.on_messages(
+            [TextMessage(content=task, source="user")],
+            cancellation_token
+        )
+        
+        writer_reply = writer_response.chat_message.content
         last_writer_reply = writer_reply
         full_response += writer_reply
         
         print(f"[第{current_turn}轮] Reviewer评审中...")
         
-        reviewer_reply = await testcase_reviewer.generate_reply(
-            messages=[{"role": "user", "content": f"请评审以下测试用例：\n{writer_reply}"}]
+        reviewer_content = f"请评审以下测试用例：\n{writer_reply}"
+        
+        reviewer_response = await testcase_reviewer.on_messages(
+            [TextMessage(content=reviewer_content, source="user")],
+            cancellation_token
         )
+        reviewer_reply = reviewer_response.chat_message.content
         full_response += "\n" + reviewer_reply
         
         if "APPROVE" in reviewer_reply:
@@ -509,10 +420,7 @@ async def generate_testcases(task):
             print(f"[第{current_turn}轮] ❌ REJECT - 需要修正")
             
             if current_turn < max_turns:
-                messages.append({
-                    "role": "user",
-                    "content": f"请修复以下问题并重新生成测试用例：\n{reviewer_reply}"
-                })
+                task = build_reject_retry_prompt(base_prompt, reviewer_reply)
         else:
             review_result = reviewer_reply
             print(f"[第{current_turn}轮] ⚠️ 未明确判定，结束流程")
@@ -779,35 +687,6 @@ def retrieve_api(task: str, index, docs, top_k=1):
     
     return results[0] if results else None #最终返回最匹配的接口作为RAG上下文
 
-#构造增强Prompt，拼接接口信息
-def build_rag_prompt(task: str, api_info: dict) -> str:
-    """
-    【RAG模块】构建增强Prompt，将检索到的接口信息注入
-    约束LLM生成符合接口定义的测试用例
-    """
-    #把检索到的接口信息拼进Prompt里，用来约束大模型生成更准确的测试用例
-    if api_info is None:
-        return task
-    #提取了请求参数，返回字段
-    params_str = ", ".join(api_info.get("params", [])) if api_info.get("params") else "无"
-    resp_str = ", ".join(api_info.get("response_fields", [])) if api_info.get("response_fields") else "无"
-    #构建rag上下文(将接口定义转化为结构化上下文，作为模型生成的约束条件)；在prompt中增加明确约束，引导模型输出符合接口规范的测试用例
-    rag_context = f"""
-【接口信息（来自Swagger文档）】
-接口名称: {api_info.get('name', '未知')}
-请求路径: {api_info.get('path', '未知')}
-请求方法: {api_info.get('method', '未知')}
-请求参数: {params_str}
-返回字段: {resp_str}
-
-请基于以上接口信息生成测试用例，确保：
-1. 测试用例的input参数与接口参数一致
-2. 覆盖正常、异常、边界三种场景
-3. 输出纯JSON格式
-"""
-    return rag_context + "\n原始需求: " + task #拼接上原来的需求
-
-
 def validate_case(testcases):
     """
     【校验模块】深度校验测试用例结构
@@ -890,94 +769,45 @@ def validate_case(testcases):
 
 
 
-def build_feedback_prompt(task: str, errors: list) -> str:
-    """
-    【自反馈模块】构建错误反馈Prompt
-    将校验错误信息注入Prompt，指导LLM修正生成
-    """
-    error_messages = []
-    for error in errors:
-        error_messages.append(f"- {error['message']}")
-    
-    feedback = f"""你需要修复上一轮生成的测试用例问题。
-
-【错误信息】
-{chr(10).join(error_messages)}
-
----
-
-【强制要求】
-
-1. 你必须重新生成完整的测试用例JSON
-2. 输出必须是一个合法JSON对象（以{{开头，以}}结尾）
-3. 禁止输出任何解释、说明、分析、提示语
-4. 禁止输出"以下是修正结果"等文本
-5. 每个用例必须包含字段：
-   - name
-   - path
-   - method
-   - input
-   - expected
-
-6. expected必须为结构化对象：
-{{
-  "status_code": 200,
-  "body": {{}}
-}}
-
-7. 严格基于接口信息生成，不允许编造字段
-
----
-
-❗如果你输出的不是JSON，将视为失败
-
----
-
-原始需求：
-{task}
-
-请直接输出JSON：
-"""
-    return feedback
-
-
-async def generate_with_feedback(task: str, max_retry: int = 2):
+async def generate_with_feedback(task: str, base_prompt: str = "", max_retry: int = 2):
     """
     【自反馈生成函数】带重试机制的测试用例生成
     流程:
     1. 第一轮: 正常生成
-    2. 校验失败 -> 第二轮: 强化约束Prompt重新生成
+    2. 校验失败 -> 第二轮: 基于base_prompt追加强化约束重新生成
     3. 返回最后一次有效结果
+
+    为什么retry必须基于base_prompt而非重新拼接:
+      retry时如果完全重新拼接Prompt，会丢失base_prompt中的:
+      1. ROLE_DEFINITION - 角色定义
+      2. RAG上下文 - 接口定义信息
+      3. OUTPUT_FORMAT - 输出格式约束
+      4. OUTPUT_EXAMPLE - 输出示例
+      正确做法是: base_prompt（保留完整结构）+ retry约束（追加），
+      通过build_retry_prompt统一构建，确保retry不丢失原始Prompt结构。
+
+    输入:
+      task: 用户需求（作为user message）
+      base_prompt: 基础Prompt（来自build_prompt，作为system_message）
+      max_retry: 最大重试次数
     """
-    #初始化
-    original_task = task
     retry_count = 0
     last_testcases = None
-    #进入循环，最多两轮
+    
     while retry_count < max_retry:
         print(f"\n{'='*50}")
         print(f"[第{retry_count + 1}轮生成] 开始生成测试用例...")
         print(f"{'='*50}")
-        #第二轮加强化约束：给prompt加了一堆“强制规则”
-        #如果第一轮生成不合格，会在第二轮中增强prompt约束，引导模型生成更规范的结果
-        current_task = task
-        if retry_count == 1:
-            print("[第2轮] 使用强化约束prompt...")
-            current_task = original_task + """
-
----
-
-【重要提醒】请务必生成至少一个完整测试用例：
-
-* 必须包含 path、method、input、expected
-* expected必须为结构化对象
-* 禁止返回空JSON {}
-* 禁止输出任何解释文本
-
-如果输出不是JSON，将视为失败
-"""
         
-        testcases = await generate_testcases(current_task) #调用LLM模型生成用例
+        current_task = task
+        current_base_prompt = base_prompt
+        
+        if retry_count == 1:
+            print("[第2轮] 使用强化约束prompt（基于base_prompt追加约束）...")
+            fail_reason = "上一轮生成结果未通过JSON校验"
+            current_base_prompt = build_retry_prompt(base_prompt, fail_reason)
+        
+        testcases = await generate_testcases(current_task, current_base_prompt)
         #校验结构是否正常
         if testcases is None:
             print(f"[第{retry_count + 1}轮生成] ⚠️ 无法提取有效JSON，触发下一轮")
@@ -1058,109 +888,6 @@ def postprocess_testcases(testcases, max_cases=10):
     print(f"[后处理] 原始用例数: {original_total}, 去重: {dedup_count}, 最终: {total_count}")
     
     return result
-
-
-def analyze_test_quality(testcases):
-    """
-    【质量评估模块】评估测试用例质量
-    评分维度:
-    1. 断言完整性: status_code(0.3分) + body断言(0.5分)
-    2. 场景覆盖: abnormal/boundary额外加分(0.2分)
-    输出: 平均评分 + 分类统计 + 用例详情
-    """
-    def detect_category(case, original_category):
-        """检测用例类型：优先用type字段，其次用名称关键词"""
-        case_type = case.get("type", "")
-        if case_type:
-            if "正常" in case_type or case_type.lower() == "normal":
-                return "normal"
-            elif "异常" in case_type or case_type.lower() == "abnormal":
-                return "abnormal"
-            elif "边界" in case_type or case_type.lower() == "boundary":
-                return "boundary"
-        
-        name = case.get("name", "")
-        if "正常" in name:
-            return "normal"
-        elif "异常" in name:
-            return "abnormal"
-        elif "边界" in name:
-            return "boundary"
-        
-        return original_category
-    
-    all_cases = []
-    for category in ["normal", "abnormal", "boundary"]:
-        for case in testcases.get(category, []):
-            detected_category = detect_category(case, category)
-            all_cases.append((detected_category, case))
-    
-    if not all_cases:
-        print("[质量评估] 无用例可评估")
-        return {"avg_score": 0, "details": [], "category_counts": {"normal": 0, "abnormal": 0, "boundary": 0}}
-    
-    details = []
-    category_counts = {"normal": 0, "abnormal": 0, "boundary": 0}
-    
-    for category, case in all_cases:
-        category_counts[category] = category_counts.get(category, 0) + 1
-        score = 0.0
-        expected = case.get("expected", {})
-        
-        if "status_code" in expected:
-            score += 0.3
-        
-        body_assert = expected.get("body", {})
-        if body_assert:
-            score += 0.3
-            if len(body_assert) > 0:
-                score += 0.2
-        
-        if category in ["abnormal", "boundary"]:
-            score += 0.2
-        
-        score = min(round(score, 2), 1.0)
-        details.append({
-            "name": case.get("name", "未命名"),
-            "category": category,
-            "score": score
-        })
-    
-    avg_score = round(sum(d["score"] for d in details) / len(details), 2)
-    
-    print(f"[质量评估] 平均得分: {avg_score}")
-    print(f"[质量评估] 用例分类统计: normal={category_counts['normal']}, abnormal={category_counts['abnormal']}, boundary={category_counts['boundary']}")
-    for d in details:
-        print(f"  [{d['category']}] {d['name']}: {d['score']}")
-    
-    return {"avg_score": avg_score, "details": details, "category_counts": category_counts}
-
-
-def analyze_test_coverage(testcases, swagger_docs=None):
-    """
-    【覆盖率分析模块】统计测试用例覆盖的API接口
-    轻量统计: 基于用例中的method+path计算覆盖接口数
-    """
-    all_cases = []
-    for category in ["normal", "abnormal", "boundary"]:
-        for case in testcases.get(category, []):
-            all_cases.append(case)
-    
-    covered_apis = set()
-    for case in all_cases:
-        method = case.get("method", "").upper()
-        path = case.get("path", "")
-        if method and path:
-            covered_apis.add(f"{method} {path}")
-    
-    print(f"[覆盖率] 覆盖接口数: {len(covered_apis)}")
-    for api in covered_apis:
-        print(f"  - {api}")
-    
-    return {
-        "covered_apis": len(covered_apis),
-        "api_list": list(covered_apis)
-    }
 
 
 def generate_json_testcases(testcases, base_url=None):
@@ -1257,142 +984,6 @@ def save_json_file(testcases, file_path=None):
     return file_path
 
 
-def generate_pytest_script(testcases, base_url):
-    """
-    【pytest脚本生成模块】将JSON测试用例转换为可执行的pytest脚本
-    处理内容:
-    1. URL路径参数替换 (如 /pet/{petId} -> /pet/123)
-    2. HTTP请求构造 (GET/POST/PUT/DELETE/PATCH)
-    3. 断言生成 (status_code + body字段)
-    """
-    DEFAULT_BASE_URL = "https://example.com"
-    if not base_url or not base_url.startswith("http"):
-        base_url = DEFAULT_BASE_URL
-    
-    script_lines = [
-        '#!/usr/bin/env python',
-        '# -*- coding: utf-8 -*-',
-        '"""AI生成的pytest测试脚本"""',
-        'import requests',
-        'import pytest',
-        '',
-        f'BASE_URL = "{base_url}"',
-        '',
-    ]
-    
-    def replace_path_params(path, path_params):
-        """
-        替换URL路径参数
-        如 /pet/{petId} -> /pet/123
-        未定义参数使用默认值1
-        """
-        if not path:
-            return path
-        result = path
-        if path_params:
-            for param_name, param_value in path_params.items():
-                placeholder = '{' + param_name + '}'
-                result = result.replace(placeholder, str(param_value))
-        remaining_params = re.findall(r'\{(\w+)\}', result)
-        for param_name in remaining_params:
-            default_value = "1"
-            placeholder = '{' + param_name + '}'
-            result = result.replace(placeholder, default_value)
-        return result
-    
-    case_index = 0
-    for category in ["normal", "abnormal", "boundary"]:
-        cases = testcases.get(category, [])
-        for case in cases:
-            case_index += 1
-            name = case.get("name", f"测试用例{case_index}")
-            method = case.get("method", "POST").upper()
-            path = case.get("path", "")
-            input_data = case.get("input", {})
-            expected = case.get("expected", {})
-            expected_status = expected.get("status_code", 200)
-            expected_body = expected.get("body", {})
-            headers = input_data.get("headers", {})
-            query_params = input_data.get("query_params", {})
-            path_params = input_data.get("path_parameters", {})
-            
-            func_name = f"test_{category}_{case_index}"
-            func_name = func_name.replace("-", "_").replace(" ", "_")
-            
-            replaced_path = replace_path_params(path, path_params)
-            
-            body_data = {k: v for k, v in input_data.items() 
-                        if k not in ["headers", "query_params", "path_parameters"]}
-            
-            script_lines.append(f'def {func_name}():')
-            script_lines.append(f'    """{name}"""')
-            
-            if replaced_path:
-                script_lines.append(f'    url = f"{{BASE_URL}}{replaced_path}"')
-            else:
-                script_lines.append(f'    url = BASE_URL')
-            
-            if headers:
-                headers_json = json.dumps(headers, ensure_ascii=False)
-                script_lines.append(f'    headers = {headers_json}')
-            
-            if query_params:
-                params_json = json.dumps(query_params, ensure_ascii=False)
-                script_lines.append(f'    params = {params_json}')
-            
-            if body_data:
-                body_json = json.dumps(body_data, ensure_ascii=False)
-                script_lines.append(f'    payload = {body_json}')
-            
-            script_lines.append(f'    print(f"[请求] Method: {method}, URL: {{url}}")')
-            if headers:
-                script_lines.append(f'    print(f"[请求] Headers: {{headers}}")')
-            if query_params:
-                script_lines.append(f'    print(f"[请求] Query Params: {{params}}")')
-            if body_data:
-                script_lines.append(f'    print(f"[请求] Payload: {{payload}}")')
-            
-            request_args = ["url"]
-            if headers:
-                request_args.append("headers=headers")
-            if query_params:
-                request_args.append("params=params")
-            if body_data and method not in ["GET", "DELETE"]:
-                request_args.append("json=payload")
-            request_args.append("timeout=10")
-            
-            args_str = ", ".join(request_args)
-            
-            if method == "GET":
-                script_lines.append(f'    response = requests.get({args_str})')
-            elif method == "POST":
-                script_lines.append(f'    response = requests.post({args_str})')
-            elif method == "PUT":
-                script_lines.append(f'    response = requests.put({args_str})')
-            elif method == "DELETE":
-                script_lines.append(f'    response = requests.delete({args_str})')
-            elif method == "PATCH":
-                script_lines.append(f'    response = requests.patch({args_str})')
-            else:
-                script_lines.append(f'    response = requests.{method.lower()}({args_str})')
-            
-            script_lines.append(f'    print(f"[响应] Status: {{response.status_code}}")')
-            script_lines.append(f'    try:')
-            script_lines.append(f'        print(f"[响应] Body: {{response.json()}}")')
-            script_lines.append(f'    except:')
-            script_lines.append(f'        print(f"[响应] Body: {{response.text}}")')
-            
-            script_lines.append(f'    assert response.status_code == {expected_status}')
-            
-            if expected_body:
-                for k, v in expected_body.items():
-                    script_lines.append(f'    assert response.json().get("{k}") == {json.dumps(v, ensure_ascii=False)}')
-            
-            script_lines.append('')
-    
-    return '\n'.join(script_lines)
-
-
 def main():
     """
     【主入口函数】Streamlit Web应用主流程
@@ -1439,6 +1030,7 @@ def main():
         final_base_url = None
         swagger_base_url = None
         swagger_docs = None
+        api_info = None
         
         if swagger_path and os.path.exists(swagger_path):
             with st.spinner("🔍 RAG检索匹配接口（Hybrid Search + Rerank）..."):
@@ -1453,7 +1045,6 @@ def main():
                     if swagger_base_url:
                         st.info(f"📌 Swagger解析 base_url: **{swagger_base_url}**")
                     if api_info:
-                        task = build_prompt(api_info, task)
                         st.info(f"📌 RAG匹配接口: **{api_info['name']}** ({api_info['method']} {api_info['path']})")
                     else:
                         st.warning("RAG未匹配到相关接口，使用原始需求生成")
@@ -1470,15 +1061,11 @@ def main():
         st.info(f"🔗 最终使用的 base_url: **{final_base_url}**")
         
         with st.spinner("AI正在生成测试用例..."):
-            task = f"""
-需求描述: {user_input}
-
-请生成接口测试用例，包含正常场景、异常场景和边界场景。
-必须输出JSON格式，不要输出任何其他内容。
-"""
+            base_prompt = build_prompt(api_info, user_input)
+            writer_task = user_input
             
             try:
-                testcases = asyncio.run(generate_with_feedback(task))
+                testcases = asyncio.run(generate_with_feedback(writer_task, base_prompt))
             except Exception as e:
                 st.error(f"AI生成测试用例失败: {str(e)}")
                 return
@@ -1509,24 +1096,17 @@ def main():
         total_after = sum(len(testcases.get(k, [])) for k in ["normal", "abnormal", "boundary"])
         st.info(f"去重 + 数量控制后，最终用例数: **{total_after}**")
         
-        quality_result = analyze_test_quality(testcases)
-        coverage_result = analyze_test_coverage(testcases, swagger_docs)
+        quality_result = evaluate_testcases(testcases)
         
-        st.subheader("📊 用例质量与覆盖率分析")
-        col_q1, col_q2, col_q3 = st.columns(3)
-        col_q1.metric("质量评分", f"{quality_result['avg_score']}")
-        col_q2.metric("覆盖接口数", f"{coverage_result['covered_apis']}")
-        col_q3.metric("用例分类", f"n={quality_result['category_counts']['normal']}, a={quality_result['category_counts']['abnormal']}, b={quality_result['category_counts']['boundary']}")
+        st.subheader("📊 用例质量评估")
+        col_q1, col_q2, col_q3, col_q4 = st.columns(4)
+        col_q1.metric("JSON合法性", "✅ 合法" if quality_result["json_valid"] else "❌ 非法")
+        col_q2.metric("结构完整率", f"{quality_result['structure_score']}")
+        col_q3.metric("有效用例率", f"{quality_result['valid_case_rate']}")
+        col_q4.metric("用例数", f"{quality_result['valid_cases']}/{quality_result['total_cases']}")
         
-        if quality_result["details"]:
-            with st.expander("📋 用例评分详情", expanded=False):
-                for d in quality_result["details"]:
-                    st.write(f"**[{d['category']}]** {d['name']}: `{d['score']}`")
-        
-        if coverage_result["api_list"]:
-            with st.expander("📋 覆盖接口列表", expanded=False):
-                for api in coverage_result["api_list"]:
-                    st.write(f"- `{api}`")
+        coverage = quality_result["coverage"]
+        st.markdown(f"**场景覆盖**: 正常场景 {'✅' if coverage['normal'] else '❌'} | 异常场景 {'✅' if coverage['abnormal'] else '❌'} | 边界场景 {'✅' if coverage['boundary'] else '❌'}")
         
         json_file_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'test_data.json')
         with open(json_file_path, "w", encoding="utf-8") as f:
